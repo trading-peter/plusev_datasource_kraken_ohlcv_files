@@ -1,22 +1,25 @@
 package main
 
 import (
-	"encoding/csv"
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	ex "github.com/plusev-terminal/go-plugin-common/datasrc/exchange"
 	m "github.com/plusev-terminal/go-plugin-common/meta"
 	"github.com/plusev-terminal/go-plugin-common/plugin"
+	"github.com/plusev-terminal/go-plugin-common/requester"
+	rt "github.com/plusev-terminal/go-plugin-common/requester/types"
 	"github.com/plusev-terminal/go-plugin-common/trading"
 )
+
+const dataDir = "/data"
 
 // ============================================================================
 // Main - Register the plugin
@@ -33,20 +36,9 @@ func main() {}
 // Plugin Implementation
 // ============================================================================
 
-// filenamePattern matches Kraken archive filenames like "XBTEUR_1.csv"
-// Captures: full pair name (e.g. "XBTEUR")
-var filenamePattern = regexp.MustCompile(`^([A-Z0-9.]+)_1\.csv$`)
-
-// Known quote currencies in Kraken's naming (checked longest-first to avoid
-// matching a prefix like "USD" when "USDT" is the actual quote).
-var knownQuotes = []string{
-	"PYUSD", "USDT", "USDC",
-	"AUD", "CAD", "CHF", "DAI", "ETH", "EUR", "GBP", "JPY",
-	"USD", "XBT", "DOT", "AED",
-}
-
 type KrakenOHLCVPlugin struct {
 	config *plugin.ConfigStore
+	req    *requester.Requester
 }
 
 func (p *KrakenOHLCVPlugin) GetMeta() m.Meta {
@@ -55,7 +47,7 @@ func (p *KrakenOHLCVPlugin) GetMeta() m.Meta {
 		Name:        "Kraken Historical OHLCV Files",
 		AppID:       "datasrc",
 		Category:    "file",
-		Description: "Serves OHLCV candle data from Kraken's downloadable historical CSV archives. Place the CSV files in the plugin's data folder.",
+		Description: "Serves OHLCV candle data from Kraken's downloadable historical CSV archives. Extract Kraken_OHLCVT.zip into the plugin's data folder.",
 		Author:      "trading_peter",
 		Version:     "v1.0.0",
 		Repository:  "https://github.com/trading-peter/plusev_datasource_kraken_ohlcv_files",
@@ -64,6 +56,21 @@ func (p *KrakenOHLCVPlugin) GetMeta() m.Meta {
 			{Kind: "x.com", Value: "https://x.com/trading_peter"},
 		},
 		Resources: m.ResourceAccess{
+			AllowedNetworkTargets: []m.NetworkTargetRule{
+				{
+					Pattern: "https://api.kraken.com/*",
+					// Kraken Spot public endpoints: "Calling the public
+					// endpoints at a frequency of 1 per second (or less)
+					// would remain within the rate limits"; public endpoints
+					// other than Trades and OHLC are rate limited by IP
+					// address only. Source (retrieved 2026-10-31):
+					// https://support.kraken.com/articles/206548367-what-are-the-api-rate-limits-
+					// This plugin only calls /0/public/AssetPairs.
+					Limits: []m.RateLimitRule{
+						m.NewRateLimitRule("public", 1, time.Second).WithLabel("Public endpoints"),
+					},
+				},
+			},
 			FsWriteAccess: map[string]string{
 				"data": "/data",
 			},
@@ -73,12 +80,12 @@ func (p *KrakenOHLCVPlugin) GetMeta() m.Meta {
 }
 
 func (p *KrakenOHLCVPlugin) GetConfigFields() []plugin.ConfigField {
-	// No configuration needed — operates purely on files in /data
 	return []plugin.ConfigField{}
 }
 
 func (p *KrakenOHLCVPlugin) OnInit(config *plugin.ConfigStore) error {
 	p.config = config
+	p.req = requester.NewRequester()
 	return nil
 }
 
@@ -87,26 +94,9 @@ func (p *KrakenOHLCVPlugin) OnShutdown() error {
 }
 
 func (p *KrakenOHLCVPlugin) GetRateLimits() []plugin.RateLimit {
-	return []plugin.RateLimit{
-		{
-			Command: ex.CMD_GET_MARKETS,
-			Scope:   []plugin.RateLimitScope{plugin.RateLimitScopeIP},
-			RPS:     10.0, // Conservative rate limit
-			Burst:   1,
-		},
-		{
-			Command: ex.CMD_GET_TIMEFRAMES,
-			Scope:   []plugin.RateLimitScope{plugin.RateLimitScopeIP},
-			RPS:     10.0,
-			Burst:   1,
-		},
-		{
-			Command: ex.CMD_GET_OHLCV,
-			Scope:   []plugin.RateLimitScope{plugin.RateLimitScopeIP},
-			RPS:     10.0,
-			Burst:   1,
-		},
-	}
+	// Empty on purpose: limits are declared on the manifest network target above;
+	// an explicit empty array opts out of the legacy per-command limiter.
+	return []plugin.RateLimit{}
 }
 
 func (p *KrakenOHLCVPlugin) RegisterCommands(router *plugin.CommandRouter) {
@@ -120,15 +110,18 @@ func (p *KrakenOHLCVPlugin) RegisterCommands(router *plugin.CommandRouter) {
 // ============================================================================
 
 func (p *KrakenOHLCVPlugin) handleGetMarkets(params map[string]any) plugin.Response {
-	markets, err := p.scanMarkets()
+	markets, err := p.fetchMarkets()
 	if err != nil {
 		return plugin.ErrorResponse(err)
 	}
+
 	return plugin.SuccessResponse(markets, time.Hour)
 }
 
 func (p *KrakenOHLCVPlugin) handleGetTimeframes(params map[string]any) plugin.Response {
-	return plugin.SuccessResponse([]string{"1m"}, time.Hour*24)
+	// Timeframe values correspond to the minute-count suffixes in Kraken's CSV filenames.
+	// e.g. XBTEUR_1.csv → 1m, XBTEUR_60.csv → 1h, XBTEUR_1440.csv → 1D
+	return plugin.SuccessResponse([]string{"1m", "5m", "15m", "30m", "1h", "4h", "12h", "1D"}, time.Hour*24)
 }
 
 func (p *KrakenOHLCVPlugin) handleGetOHLCV(params map[string]any) plugin.Response {
@@ -138,57 +131,102 @@ func (p *KrakenOHLCVPlugin) handleGetOHLCV(params map[string]any) plugin.Respons
 		return plugin.ErrorResponseMsg("market.symbol is required")
 	}
 
-	// Find the matching CSV file.
-	// The symbol in the market should match the filename pattern.
-	// Try exact match first, then try resolving base/quote to filename.
-	csvPath, err := p.resolveCSVPath(ohlcvParams.Market)
+	if ohlcvParams.Timeframe == "" {
+		return plugin.ErrorResponseMsg("timeframe is required")
+	}
+
+	tf, err := trading.TimeframeFromString(ohlcvParams.Timeframe)
+	if err != nil {
+		return plugin.ErrorResponseMsg("invalid timeframe: " + ohlcvParams.Timeframe)
+	}
+
+	entry, err := p.resolveCSVPath(ohlcvParams.Market.Symbol, tf.ToMinutes())
 	if err != nil {
 		return plugin.ErrorResponse(err)
 	}
 
-	records, err := p.readOHLCV(csvPath, ohlcvParams.StartTime, ohlcvParams.EndTime, ohlcvParams.Limit)
+	f, err := os.Open(entry)
+	if err != nil {
+		return plugin.ErrorResponse(fmt.Errorf("failed to open CSV: %w", err))
+	}
+	defer f.Close()
+
+	if ohlcvParams.StartTime != nil {
+		seekBinarySearch(f, ohlcvParams.StartTime.Unix())
+	}
+
+	// When sorting descending, we must read the full window first so that
+	// the limit is applied to the most-recent candles, not the oldest ones.
+	readLimit := ohlcvParams.Limit
+	if ohlcvParams.Sort == "desc" {
+		readLimit = 0
+	}
+
+	records, err := p.readOHLCV(f, ohlcvParams.StartTime, ohlcvParams.EndTime, readLimit)
 	if err != nil {
 		return plugin.ErrorResponse(err)
+	}
+
+	if ohlcvParams.Sort == "desc" {
+		for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 {
+			records[i], records[j] = records[j], records[i]
+		}
+		if ohlcvParams.Limit > 0 && len(records) > ohlcvParams.Limit {
+			records = records[:ohlcvParams.Limit]
+		}
 	}
 
 	return plugin.SuccessResponse(records)
 }
 
 // ============================================================================
-// File scanning / market discovery
+// Kraken REST API
 // ============================================================================
 
-func (p *KrakenOHLCVPlugin) scanMarkets() ([]trading.Market, error) {
-	entries, err := os.ReadDir("/data")
+type krakenAssetPairsResponse struct {
+	Error  []string                       `json:"error"`
+	Result map[string]krakenAssetPairInfo `json:"result"`
+}
+
+type krakenAssetPairInfo struct {
+	Altname string `json:"altname"`
+	WSName  string `json:"wsname"`
+}
+
+func (p *KrakenOHLCVPlugin) fetchMarkets() ([]trading.Market, error) {
+	var apiResp krakenAssetPairsResponse
+
+	_, err := p.req.Send(&rt.Request{
+		URL:    "https://api.kraken.com/0/public/AssetPairs",
+		Method: "GET",
+	}, &apiResp)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []trading.Market{}, nil
-		}
-		return nil, fmt.Errorf("failed to read data directory: %w", err)
+		return nil, fmt.Errorf("kraken API request failed: %w", err)
 	}
 
-	var markets []trading.Market
-	for _, entry := range entries {
-		if entry.IsDir() {
+	if len(apiResp.Error) > 0 {
+		return nil, fmt.Errorf("kraken API error: %s", strings.Join(apiResp.Error, ", "))
+	}
+
+	markets := make([]trading.Market, 0, len(apiResp.Result))
+
+	for _, info := range apiResp.Result {
+		// Skip dark pool entries (altname ends with ".d")
+		if strings.HasSuffix(info.Altname, ".d") {
 			continue
 		}
 
-		name := entry.Name()
-		matches := filenamePattern.FindStringSubmatch(name)
-		if matches == nil {
-			continue
-		}
-
-		pairStr := matches[1]
-		base, quote := splitPair(pairStr)
+		base, quote := parseWSName(info.WSName)
 		if base == "" || quote == "" {
 			continue
 		}
 
 		markets = append(markets, trading.Market{
-			Symbol: pairStr,
-			Base:   base,
-			Quote:  quote,
+			Symbol:    info.Altname,
+			Label:     info.WSName,
+			Base:      base,
+			Quote:     quote,
+			AssetType: "spot",
 		})
 	}
 
@@ -199,81 +237,182 @@ func (p *KrakenOHLCVPlugin) scanMarkets() ([]trading.Market, error) {
 	return markets, nil
 }
 
-// splitPair splits a concatenated Kraken pair like "XBTEUR" into base and quote.
-func splitPair(pair string) (base, quote string) {
-	for _, q := range knownQuotes {
-		if strings.HasSuffix(pair, q) {
-			b := pair[:len(pair)-len(q)]
-			if b != "" {
-				return b, q
-			}
-		}
+// parseWSName splits a Kraken wsname like "XBT/EUR" into base and quote.
+func parseWSName(wsName string) (base, quote string) {
+	parts := strings.SplitN(wsName, "/", 2)
+	if len(parts) != 2 {
+		return "", ""
 	}
-	return "", ""
+	return parts[0], parts[1]
 }
 
-// resolveCSVPath finds the CSV file for a given market.
-func (p *KrakenOHLCVPlugin) resolveCSVPath(market trading.Market) (string, error) {
-	// Try symbol directly: e.g. "XBTEUR" → "XBTEUR_1.csv"
-	candidates := []string{
-		filepath.Join("/data", market.Symbol+"_1.csv"),
+// ============================================================================
+// Binary Search Seek — O(log N) robust seek
+// ============================================================================
+
+// seekBinarySearch finds the exact byte offset of the target timestamp using
+// a binary search over the file, then steps back a few kilobytes as a safety margin.
+// This perfectly handles data gaps and varying density over years.
+// O(log N) where N is bytes, ~25 seeks max for any file size.
+func seekBinarySearch(f *os.File, targetTs int64) {
+	fileSize, err := f.Seek(0, io.SeekEnd)
+	if err != nil || fileSize == 0 {
+		f.Seek(0, io.SeekStart)
+		return
 	}
 
-	// Also try base+quote concatenation if symbol differs
-	if market.Base != "" && market.Quote != "" {
-		bq := market.Base + market.Quote
-		if bq != market.Symbol {
-			candidates = append(candidates, filepath.Join("/data", bq+"_1.csv"))
+	var low int64 = 0
+	var high int64 = fileSize
+
+	for low < high {
+		mid := low + (high-low)/2
+		f.Seek(mid, io.SeekStart)
+		if mid > 0 {
+			alignToNextNewline(f)
+		}
+
+		pos, _ := f.Seek(0, io.SeekCurrent)
+		if pos >= fileSize {
+			high = mid
+			continue
+		}
+
+		var buf [128]byte
+		n, _ := f.Read(buf[:])
+		nl := bytes.IndexByte(buf[:n], '\n')
+		if nl < 0 {
+			high = mid
+			continue
+		}
+		comma := bytes.IndexByte(buf[:nl], ',')
+		if comma < 0 {
+			high = mid
+			continue
+		}
+
+		ts, ok := parseUnixBytes(buf[:comma])
+		if !ok {
+			high = mid
+			continue
+		}
+
+		if ts < targetTs {
+			low = pos + int64(nl) + 1
+		} else {
+			high = mid
 		}
 	}
 
-	for _, path := range candidates {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+	// Step back ~4KB to provide a safety margin before reading.
+	safePos := low - 4096
+	if safePos < 0 {
+		safePos = 0
+	}
+	f.Seek(safePos, io.SeekStart)
+	if safePos > 0 {
+		alignToNextNewline(f)
+	}
+}
+
+// parseUnixBytes parses a base-10 integer from a byte slice with zero allocations.
+func parseUnixBytes(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var v int64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + int64(c-'0')
+	}
+	return v, true
+}
+
+// alignToNextNewline reads forward until after the next '\n' so the file
+// position is at the start of a complete CSV row.
+func alignToNextNewline(f *os.File) {
+	var buf [512]byte
+	for {
+		nr, err := f.Read(buf[:])
+		for i := 0; i < nr; i++ {
+			if buf[i] == '\n' {
+				// Seek back to just after this newline.
+				f.Seek(-int64(nr-i-1), io.SeekCurrent)
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// resolveCSVPath finds the extracted CSV file for the given symbol and timeframe.
+// Kraken's archive extracts into a subdirectory; we search one level deep.
+func (p *KrakenOHLCVPlugin) resolveCSVPath(symbol string, minutes int) (string, error) {
+	filename := fmt.Sprintf("%s_%d.csv", symbol, minutes)
+
+	// Check directly in /data first.
+	direct := filepath.Join(dataDir, filename)
+	if _, err := os.Stat(direct); err == nil {
+		return direct, nil
+	}
+
+	// Also search one subdirectory level (e.g. /data/master_q4/XBTEUR_1.csv).
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read data directory: %w", err)
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(dataDir, e.Name(), filename)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
 		}
 	}
 
-	return "", fmt.Errorf("no CSV file found for market %s (tried: %s)", market.Symbol, strings.Join(candidates, ", "))
+	return "", fmt.Errorf("no CSV file found for market %s at %dm (looked for: %s)", symbol, minutes, filename)
 }
 
 // ============================================================================
 // CSV reading
 // ============================================================================
 
-// readOHLCV reads a Kraken archive CSV and returns OHLCVRecords within the time range.
+// readOHLCV streams a Kraken CSV from r and returns records within the time range.
 // CSV format (no header): timestamp,open,high,low,close,volume,count
 // Timestamp is unix seconds. File is sorted ascending by timestamp.
-func (p *KrakenOHLCVPlugin) readOHLCV(path string, startTime, endTime *time.Time, limit int) ([]trading.OHLCVRecord, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open CSV file: %w", err)
-	}
-	defer file.Close()
+func (p *KrakenOHLCVPlugin) readOHLCV(r io.Reader, startTime, endTime *time.Time, limit int) ([]trading.OHLCVRecord, error) {
+	scanner := bufio.NewScanner(r)
 
-	reader := csv.NewReader(file)
+	// Safely size buffer to handle long lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
 	var records []trading.OHLCVRecord
 
-	for {
-		row, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("CSV read error: %w", err)
-		}
-
-		if len(row) < 6 {
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) < 6 {
 			continue
 		}
 
-		unixTs, err := strconv.ParseInt(row[0], 10, 64)
-		if err != nil {
+		// Fast zero-allocation timestamp check
+		commaPos := bytes.IndexByte(line, ',')
+		if commaPos < 0 {
+			continue
+		}
+
+		unixTs, ok := parseUnixBytes(line[:commaPos])
+		if !ok {
 			continue
 		}
 
 		t := time.Unix(unixTs, 0).UTC()
 
-		// Apply time filters
 		if startTime != nil && t.Before(*startTime) {
 			continue
 		}
@@ -281,19 +420,28 @@ func (p *KrakenOHLCVPlugin) readOHLCV(path string, startTime, endTime *time.Time
 			break // File is sorted ascending, so we can stop here
 		}
 
+		parts := bytes.Split(line, []byte{','})
+		if len(parts) < 6 {
+			continue
+		}
+
 		records = append(records, trading.OHLCVRecord{
-			OpenTime: unixTs, // Unix seconds (consistent with other datasrc plugins)
-			Open:     row[1],
-			High:     row[2],
-			Low:      row[3],
-			Close:    row[4],
-			Volume:   row[5],
+			OpenTime: unixTs,
+			Open:     string(parts[1]),
+			High:     string(parts[2]),
+			Low:      string(parts[3]),
+			Close:    string(parts[4]),
+			Volume:   string(parts[5]),
 			IsClosed: true,
 		})
 
 		if limit > 0 && len(records) >= limit {
 			break
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("CSV read error: %w", err)
 	}
 
 	return records, nil
