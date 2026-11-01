@@ -49,7 +49,7 @@ func (p *KrakenOHLCVPlugin) GetMeta() m.Meta {
 		Category:    "file",
 		Description: "Serves OHLCV candle data from Kraken's downloadable historical CSV archives. Extract Kraken_OHLCVT.zip into the plugin's data folder.",
 		Author:      "trading_peter",
-		Version:     "v1.0.0",
+		Version: "v1.1.0",
 		Repository:  "https://github.com/trading-peter/plusev_datasource_kraken_ohlcv_files",
 		Tags:        []string{"kraken", "ohlcv", "csv", "historical", "file"},
 		Contacts: []m.AuthorContact{
