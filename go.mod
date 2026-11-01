@@ -2,7 +2,7 @@ module github.com/trading-peter/plusev_datasource_kraken_ohlcv_files
 
 go 1.25.1
 
-require github.com/plusev-terminal/go-plugin-common v1.15.0
+require github.com/plusev-terminal/go-plugin-common/v2 v2.1.0
 
 require (
 	github.com/extism/go-pdk v1.1.3 // indirect
@@ -16,5 +16,3 @@ require (
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 )
-
-replace github.com/plusev-terminal/go-plugin-common => ../plusev/go-plugin-common

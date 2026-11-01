@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	ex "github.com/plusev-terminal/go-plugin-common/datasrc/exchange"
-	m "github.com/plusev-terminal/go-plugin-common/meta"
-	"github.com/plusev-terminal/go-plugin-common/plugin"
-	"github.com/plusev-terminal/go-plugin-common/requester"
-	rt "github.com/plusev-terminal/go-plugin-common/requester/types"
-	"github.com/plusev-terminal/go-plugin-common/trading"
+	ex "github.com/plusev-terminal/go-plugin-common/v2/datasrc/exchange"
+	m "github.com/plusev-terminal/go-plugin-common/v2/meta"
+	"github.com/plusev-terminal/go-plugin-common/v2/plugin"
+	"github.com/plusev-terminal/go-plugin-common/v2/requester"
+	rt "github.com/plusev-terminal/go-plugin-common/v2/requester/types"
+	"github.com/plusev-terminal/go-plugin-common/v2/trading"
 )
 
 const dataDir = "/data"
@@ -226,7 +226,7 @@ func (p *KrakenOHLCVPlugin) fetchMarkets() ([]trading.Market, error) {
 			Label:     info.WSName,
 			Base:      base,
 			Quote:     quote,
-			AssetType: "spot",
+			AssetType: trading.AssetTypeSpot,
 		})
 	}
 
